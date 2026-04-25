@@ -51,6 +51,8 @@ Control your 4-zone RGB keyboard lighting, animation modes, brightness, and fan 
 
 ## Screenshots
 
+![GUI Screenshot](gui.png)
+![TUI Screenshot](tui.png)
 <!-- Add screenshots of the GUI and TUI here -->
 <!-- ![GUI Screenshot](screenshots/gui.png) -->
 <!-- ![TUI Screenshot](screenshots/tui.png) -->
@@ -260,9 +262,9 @@ When running under Wayland compositors (Hyprland, Sway, etc.), the GUI needs X11
 
 ## Tested On
 
-| Laptop | Distro | Kernel | Status |
-|--------|--------|--------|--------|
-| HP OMEN 16 | CachyOS (Arch) | 7.0.1-cachyos | ✅ Working |
+| Laptop                   | Distro            | Kernel          | Status |
+| ------------------------ | ----------------- | --------------- | ------ |
+| HP OMEN Transcend 14     | CachyOS (Arch)    | 6.10.10-zen2-1-zen | ✅ Working |
 
 > If you test on other models, please open an issue or PR to update this table!
 
