@@ -1,0 +1,527 @@
+#!/usr/bin/env python3
+"""omenctl — HP OMEN RGB Keyboard & Fan Control for Linux
+
+Usage:
+    omenctl              Launch GUI (auto-elevates to root)
+    omenctl gui          Launch GUI
+    omenctl tui          Launch terminal UI
+    omenctl status       Show current hardware state
+    omenctl color HEX    Set all-zone color
+    omenctl color HEX -z N  Set single zone color (0-3)
+    omenctl brightness N Set brightness (0-100)
+    omenctl mode MODE    Set animation mode
+    omenctl speed N      Set animation speed (1-10)
+    omenctl fan PROFILE  Set fan profile (auto/balanced/max)
+"""
+
+import argparse
+import curses
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+# ═══════════════════════════════════════════════════════════════
+# Device interface (shared by all frontends)
+# ═══════════════════════════════════════════════════════════════
+
+RGB_PATH = "/sys/devices/platform/omen-rgb-keyboard/rgb_zones"
+FAN_PATH = "/sys/class/hwmon/hwmon5"
+SELF_COLORED_MODES = {"rainbow", "candle", "aurora", "disco"}
+ANIM_MODES = [
+    "static", "breathing", "rainbow", "wave", "pulse",
+    "chase", "sparkle", "candle", "aurora", "disco", "gradient",
+]
+FAN_PROFILES = {"auto": "2", "max": "0"}
+FAN_PROFILE_REV = {"2": "Auto", "0": "Max"}
+PRESETS = [
+    ("Red", "FF0000"), ("Green", "00FF00"), ("Blue", "0000FF"),
+    ("White", "FFFFFF"), ("Purple", "800080"), ("Orange", "FF8000"),
+    ("Cyan", "00FFFF"), ("Pink", "FF69B4"), ("Yellow", "FFFF00"),
+]
+
+
+def sysfs_path(node):
+    if node in ("all", "brightness", "animation_mode", "animation_speed",
+                "gradient_config", "mute_led", "mute_state") or node.startswith("zone"):
+        return f"{RGB_PATH}/{node}"
+    return f"{FAN_PATH}/{node}"
+
+
+def sysfs_read(node):
+    try:
+        with open(sysfs_path(node)) as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
+def sysfs_write(node, value):
+    try:
+        with open(sysfs_path(node), "w") as f:
+            f.write(str(value))
+        return True
+    except PermissionError:
+        print(f"error: permission denied writing {sysfs_path(node)}")
+        print("  run with: sudo omenctl ...")
+        return False
+    except Exception as e:
+        print(f"error: {e}")
+        return False
+
+
+def set_color(hex_color, zone="all"):
+    hex_color = hex_color.replace("#", "").upper()
+    if not re.match(r'^[0-9A-F]{6}$', hex_color):
+        print(f"error: invalid hex color '{hex_color}'")
+        return False
+    mode = sysfs_read("animation_mode") or "static"
+    if mode in SELF_COLORED_MODES:
+        sysfs_write("animation_mode", "static")
+    return sysfs_write(zone, hex_color)
+
+
+def get_status():
+    """Return dict of all current hardware state."""
+    s = {}
+    s["brightness"] = sysfs_read("brightness") or "?"
+    s["mode"] = sysfs_read("animation_mode") or "?"
+    s["speed"] = sysfs_read("animation_speed") or "?"
+    for i in range(4):
+        s[f"zone{i}"] = sysfs_read(f"zone0{i}") or "?"
+    raw = sysfs_read("pwm1_enable")
+    s["fan"] = FAN_PROFILE_REV.get(raw, "?") if raw else "?"
+    s["fan1_rpm"] = sysfs_read("fan1_input") or "?"
+    s["fan2_rpm"] = sysfs_read("fan2_input") or "?"
+    return s
+
+
+# ═══════════════════════════════════════════════════════════════
+# Auto-elevation
+# ═══════════════════════════════════════════════════════════════
+
+def _setup_xwayland_auth():
+    """Grant root access to the X display on Wayland compositors.
+
+    On Hyprland / sway / etc., XWayland runs WITHOUT a .Xauthority file.
+    When we sudo-elevate, root can't connect to :0 because there's no
+    auth cookie.  Fix this by:
+      1. xhost +SI:localuser:root   (fast, preferred)
+      2. Generating a temp .Xauthority with 'xauth generate'
+    Returns the path to a temp XAUTHORITY file (or None).
+    """
+    display = os.environ.get("DISPLAY")
+    if not display:
+        return None
+
+    # ── Method 1: xhost (preferred, no temp files) ──
+    xhost = shutil.which("xhost")
+    if xhost:
+        try:
+            subprocess.run(
+                [xhost, "+SI:localuser:root"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            return None  # no temp file needed
+        except Exception:
+            pass
+
+    # ── Method 2: generate a temporary .Xauthority ──
+    xauth = shutil.which("xauth")
+    if xauth:
+        try:
+            tmp = tempfile.NamedTemporaryFile(
+                prefix="omenctl_xauth_", delete=False
+            )
+            tmp_path = tmp.name
+            tmp.close()
+            os.chmod(tmp_path, 0o600)
+            # Generate a cookie for the current display
+            subprocess.run(
+                [xauth, "-f", tmp_path, "generate", display, ".", "trusted"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            return tmp_path
+        except Exception:
+            pass
+
+    return None
+
+
+def ensure_root(gui=False):
+    if os.geteuid() == 0:
+        return
+    script = os.path.abspath(sys.argv[0])
+    args = sys.argv[1:]
+
+    if gui:
+        # Set up X11 auth before elevating to root
+        tmp_xauth = _setup_xwayland_auth()
+
+        # Build the environment variables to preserve through sudo
+        env_preserve = []
+        for var in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY",
+                    "XDG_RUNTIME_DIR"):
+            val = os.environ.get(var)
+            if val:
+                env_preserve.append(var)
+
+        # If we created a temp .Xauthority, tell the child process about it
+        if tmp_xauth:
+            os.environ["XAUTHORITY"] = tmp_xauth
+            if "XAUTHORITY" not in env_preserve:
+                env_preserve.append("XAUTHORITY")
+
+        sudo_cmd = ["sudo"]
+        if env_preserve:
+            sudo_cmd.append(f"--preserve-env={','.join(env_preserve)}")
+        os.execvp("sudo", sudo_cmd + [sys.executable, script] + args)
+    else:
+        os.execvp("sudo", ["sudo", sys.executable, script] + args)
+    print("error: cannot elevate to root (no sudo/pkexec)")
+    sys.exit(1)
+
+
+# ═══════════════════════════════════════════════════════════════
+# CLI commands
+# ═══════════════════════════════════════════════════════════════
+
+def cmd_status(_args):
+    s = get_status()
+    print("◆ OMEN RGB Keyboard Status")
+    print("=" * 36)
+    print(f"  Brightness   : {s['brightness']}%")
+    print(f"  Animation    : {s['mode']} (speed: {s['speed']})")
+    for i in range(4):
+        print(f"  Zone {i}       : {s[f'zone{i}']}")
+    print(f"  Fan Profile  : {s['fan']}")
+    try:
+        r1 = int(s["fan1_rpm"])
+        print(f"  Fan 1 (CPU)  : {r1:,} RPM")
+    except (ValueError, TypeError):
+        print(f"  Fan 1 (CPU)  : {s['fan1_rpm']}")
+    try:
+        r2 = int(s["fan2_rpm"])
+        print(f"  Fan 2 (GPU)  : {r2:,} RPM")
+    except (ValueError, TypeError):
+        print(f"  Fan 2 (GPU)  : {s['fan2_rpm']}")
+
+
+def cmd_color(args):
+    ensure_root()
+    zone = f"zone0{args.zone}" if args.zone is not None else "all"
+    if set_color(args.hex, zone):
+        target = f"zone {args.zone}" if args.zone is not None else "all zones"
+        print(f"Color set to {args.hex.upper()} ({target})")
+
+
+def cmd_brightness(args):
+    ensure_root()
+    v = max(0, min(100, args.value))
+    if sysfs_write("brightness", v):
+        print(f"Brightness set to {v}%")
+
+
+def cmd_mode(args):
+    ensure_root()
+    m = args.mode.lower()
+    if m not in ANIM_MODES:
+        print(f"error: unknown mode '{m}'")
+        print(f"  available: {', '.join(ANIM_MODES)}")
+        return
+    if sysfs_write("animation_mode", m):
+        print(f"Animation mode set to {m}")
+    if args.speed:
+        sv = max(1, min(10, args.speed))
+        sysfs_write("animation_speed", sv)
+        print(f"Animation speed set to {sv}")
+
+
+def cmd_speed(args):
+    ensure_root()
+    v = max(1, min(10, args.value))
+    if sysfs_write("animation_speed", v):
+        print(f"Animation speed set to {v}")
+
+
+def cmd_fan(args):
+    ensure_root()
+    p = args.profile.lower()
+    if p not in FAN_PROFILES:
+        print(f"error: unknown profile '{p}'")
+        print(f"  available: auto, max")
+        return
+    if sysfs_write("pwm1_enable", FAN_PROFILES[p]):
+        print(f"Fan profile set to {p}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# TUI (curses-based terminal interface)
+# ═══════════════════════════════════════════════════════════════
+
+class OmenTUI:
+    ITEMS = ["color", "brightness", "mode", "speed", "fan"]
+
+    def __init__(self):
+        self.sel = 0
+        self.editing_color = False
+        self.color_buf = ""
+
+    def run(self):
+        ensure_root()
+        curses.wrapper(self._main)
+
+    def _main(self, stdscr):
+        curses.curs_set(0)
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_RED, -1)     # accent
+        curses.init_pair(2, curses.COLOR_WHITE, -1)    # normal
+        curses.init_pair(3, 8, -1)                     # dim (gray)
+        curses.init_pair(4, curses.COLOR_BLACK, curses.COLOR_RED)  # selected
+        stdscr.timeout(1000)  # 1s refresh for RPM
+
+        while True:
+            self._draw(stdscr)
+            key = stdscr.getch()
+            if self.editing_color:
+                if self._handle_color_input(key):
+                    continue
+            else:
+                if key == ord("q") or key == ord("Q"):
+                    break
+                elif key == curses.KEY_UP:
+                    self.sel = (self.sel - 1) % len(self.ITEMS)
+                elif key == curses.KEY_DOWN:
+                    self.sel = (self.sel + 1) % len(self.ITEMS)
+                elif key == curses.KEY_LEFT:
+                    self._adjust(-1)
+                elif key == curses.KEY_RIGHT:
+                    self._adjust(1)
+                elif key == ord("\n") or key == curses.KEY_ENTER:
+                    self._enter()
+
+    def _draw(self, stdscr):
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        A = curses.color_pair(1) | curses.A_BOLD
+        N = curses.color_pair(2)
+        D = curses.color_pair(3)
+        S = curses.color_pair(4) | curses.A_BOLD
+
+        y = 1
+        stdscr.addstr(y, 2, "◆ OMEN", A)
+        stdscr.addstr(y, 9, " RGB Control", N)
+        y += 1
+        stdscr.addstr(y, 2, "Linux kernel driver · 4-zone RGB", D)
+        y += 1
+        stdscr.addstr(y, 2, "─" * min(40, w - 4), D)
+
+        # RPM
+        y += 1
+        s = get_status()
+        try:
+            r1 = f"{int(s['fan1_rpm']):,}"
+        except (ValueError, TypeError):
+            r1 = "—"
+        try:
+            r2 = f"{int(s['fan2_rpm']):,}"
+        except (ValueError, TypeError):
+            r2 = "—"
+        stdscr.addstr(y, 2, f"  CPU: {r1} RPM", A)
+        stdscr.addstr(y, 24, f"GPU: {r2} RPM", A)
+
+        y += 2
+        items_data = [
+            ("Color       ", s.get("zone0", "?")),
+            ("Brightness  ", f"{s['brightness']}%"),
+            ("Animation   ", s["mode"]),
+            ("Speed       ", s["speed"]),
+            ("Fan Profile ", s["fan"]),
+        ]
+
+        for i, (label, val) in enumerate(items_data):
+            prefix = " ▸ " if i == self.sel else "   "
+            attr = S if i == self.sel else N
+            stdscr.addstr(y, 2, prefix, attr)
+            stdscr.addstr(y, 5, label, attr)
+            stdscr.addstr(y, 18, str(val), A if i == self.sel else D)
+            y += 1
+
+        # Zone colors
+        y += 1
+        zone_names = ["Right", "Mid", "Left", "WASD"]
+        stdscr.addstr(y, 2, "  Zones:", D)
+        for i in range(4):
+            c = s.get(f"zone{i}", "?")
+            stdscr.addstr(y, 12 + i * 10, f"{zone_names[i]}:{c}", D)
+        y += 1
+
+        # Color input mode
+        if self.editing_color:
+            y += 1
+            stdscr.addstr(y, 2, "  Enter hex color: ", N)
+            stdscr.addstr(y, 21, self.color_buf + "▌", A)
+            y += 1
+            stdscr.addstr(y, 2, "  (Enter=apply, Esc=cancel)", D)
+
+        # Help
+        y = max(y + 2, h - 3)
+        if y < h:
+            stdscr.addstr(y, 2, "↑↓ navigate  ←→ adjust  Enter select  q quit", D)
+
+        stdscr.refresh()
+
+    def _adjust(self, delta):
+        item = self.ITEMS[self.sel]
+        if item == "brightness":
+            cur = int(sysfs_read("brightness") or "50")
+            nv = max(0, min(100, cur + delta * 5))
+            sysfs_write("brightness", nv)
+        elif item == "speed":
+            cur = int(sysfs_read("animation_speed") or "5")
+            nv = max(1, min(10, cur + delta))
+            sysfs_write("animation_speed", nv)
+        elif item == "mode":
+            cur = (sysfs_read("animation_mode") or "static").strip()
+            try:
+                idx = ANIM_MODES.index(cur)
+            except ValueError:
+                idx = 0
+            idx = (idx + delta) % len(ANIM_MODES)
+            sysfs_write("animation_mode", ANIM_MODES[idx])
+        elif item == "fan":
+            profiles = ["auto", "max"]
+            cur_raw = sysfs_read("pwm1_enable") or "2"
+            cur_name = FAN_PROFILE_REV.get(cur_raw, "Auto").lower()
+            try:
+                idx = profiles.index(cur_name)
+            except ValueError:
+                idx = 0
+            idx = (idx + delta) % len(profiles)
+            sysfs_write("pwm1_enable", FAN_PROFILES[profiles[idx]])
+        elif item == "color":
+            # Cycle through preset colors
+            cur = (sysfs_read("zone00") or "FF0000").upper()
+            preset_vals = [p[1] for p in PRESETS]
+            try:
+                idx = preset_vals.index(cur)
+            except ValueError:
+                idx = 0
+            idx = (idx + delta) % len(preset_vals)
+            set_color(preset_vals[idx])
+
+    def _enter(self):
+        item = self.ITEMS[self.sel]
+        if item == "color":
+            self.editing_color = True
+            self.color_buf = ""
+
+    def _handle_color_input(self, key):
+        if key == 27:  # Esc
+            self.editing_color = False
+            self.color_buf = ""
+            return True
+        elif key in (curses.KEY_ENTER, ord("\n")):
+            if self.color_buf:
+                set_color(self.color_buf)
+            self.editing_color = False
+            self.color_buf = ""
+            return True
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            self.color_buf = self.color_buf[:-1]
+            return True
+        elif 32 <= key < 127 and len(self.color_buf) < 6:
+            ch = chr(key).upper()
+            if ch in "0123456789ABCDEF":
+                self.color_buf += ch
+            return True
+        return True
+
+
+# ═══════════════════════════════════════════════════════════════
+# GUI launcher
+# ═══════════════════════════════════════════════════════════════
+
+def run_gui():
+    ensure_root(gui=True)
+    # Import the GUI from utils.py in the same directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, script_dir)
+    from utils import OmenControlPanel
+    app = OmenControlPanel()
+    app.mainloop()
+
+
+# ═══════════════════════════════════════════════════════════════
+# Main entry point
+# ═══════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="omenctl",
+        description="HP OMEN RGB Keyboard & Fan Control for Linux",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    # gui
+    sub.add_parser("gui", help="Launch graphical interface")
+
+    # tui
+    sub.add_parser("tui", help="Launch terminal interface")
+
+    # status
+    sub.add_parser("status", help="Show current hardware state")
+
+    # color
+    p = sub.add_parser("color", help="Set zone color (hex)")
+    p.add_argument("hex", help="Color in hex (e.g. FF0000)")
+    p.add_argument("-z", "--zone", type=int, choices=[0, 1, 2, 3],
+                   help="Zone number (omit for all)")
+
+    # brightness
+    p = sub.add_parser("brightness", help="Set brightness (0-100)")
+    p.add_argument("value", type=int)
+
+    # mode
+    p = sub.add_parser("mode", help="Set animation mode")
+    p.add_argument("mode", choices=ANIM_MODES)
+    p.add_argument("-s", "--speed", type=int, help="Speed (1-10)")
+
+    # speed
+    p = sub.add_parser("speed", help="Set animation speed (1-10)")
+    p.add_argument("value", type=int)
+
+    # fan
+    p = sub.add_parser("fan", help="Set fan profile")
+    p.add_argument("profile", choices=["auto", "max"])
+
+    args = parser.parse_args()
+
+    if args.command is None or args.command == "gui":
+        run_gui()
+    elif args.command == "tui":
+        OmenTUI().run()
+    elif args.command == "status":
+        cmd_status(args)
+    elif args.command == "color":
+        cmd_color(args)
+    elif args.command == "brightness":
+        cmd_brightness(args)
+    elif args.command == "mode":
+        cmd_mode(args)
+    elif args.command == "speed":
+        cmd_speed(args)
+    elif args.command == "fan":
+        cmd_fan(args)
+
+
+if __name__ == "__main__":
+    main()
