@@ -29,7 +29,22 @@ import time
 # ═══════════════════════════════════════════════════════════════
 
 RGB_PATH = "/sys/devices/platform/omen-rgb-keyboard/rgb_zones"
-FAN_PATH = "/sys/class/hwmon/hwmon5"
+
+
+def _get_fan_path():
+    """Auto-detect the HP fan hwmon path instead of hardcoding it."""
+    import glob
+    for path in glob.glob('/sys/class/hwmon/hwmon*'):
+        try:
+            with open(f"{path}/name", 'r') as f:
+                if f.read().strip() in ("hp", "hp_wmi"):
+                    return path
+        except Exception:
+            pass
+    return "/sys/class/hwmon/hwmon9"  # Safe fallback
+
+
+FAN_PATH = _get_fan_path()
 SELF_COLORED_MODES = {"rainbow", "candle", "aurora", "disco"}
 ANIM_MODES = [
     "static", "breathing", "rainbow", "wave", "pulse",

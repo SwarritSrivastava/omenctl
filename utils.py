@@ -1,12 +1,26 @@
+import glob
 import os
 import re
 import customtkinter as ctk
 from tkinter import colorchooser
 
+
+def _get_fan_path():
+    """Auto-detect the HP fan hwmon path instead of hardcoding it."""
+    for path in glob.glob('/sys/class/hwmon/hwmon*'):
+        try:
+            with open(f"{path}/name", 'r') as f:
+                if f.read().strip() in ("hp", "hp_wmi"):
+                    return path
+        except Exception:
+            pass
+    return "/sys/class/hwmon/hwmon9"  # Safe fallback
+
+
 # --- Hardware Interface ---
 class OmenDevice:
     RGB_PATH = "/sys/devices/platform/omen-rgb-keyboard/rgb_zones"
-    FAN_PATH = "/sys/class/hwmon/hwmon5"
+    FAN_PATH = _get_fan_path()
 
     # Modes that generate their own colors — changing user color is meaningless
     SELF_COLORED_MODES = {"rainbow", "candle", "aurora", "disco"}
