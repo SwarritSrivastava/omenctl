@@ -130,9 +130,9 @@ pip install customtkinter
 
 ### 3. Fan Control (hwmon)
 
-Fan RPM and profile control uses the hwmon sysfs interface. The path defaults to `/sys/class/hwmon/hwmon5`. If your system uses a different hwmon index, update `FAN_PATH` in both `omenctl` and `utils.py`.
+Fan RPM and profile control uses the hwmon sysfs interface. It automaticaly finds the path using grep and sets it as per the driver config  in both `omenctl` and `utils.py`.
 
-Check your fan hwmon path:
+In order to Check your fan hwmon path:
 
 ```bash
 for d in /sys/class/hwmon/hwmon*/; do
@@ -262,8 +262,8 @@ When running under Wayland compositors (Hyprland, Sway, etc.), the GUI needs X11
 
 ## Tested On
 
-| Laptop                   | Distro            | Kernel          | Status |
-| ------------------------ | ----------------- | --------------- | ------ |
+| Laptop                   | Distro            |       Kernel       |   Status   |
+| ------------------------ | ----------------- | ------------------ | ---------- |
 | HP OMEN Transcend 14     | CachyOS (Arch)    | 6.10.10-zen2-1-zen | ✅ Working |
 
 > If you test on other models, please open an issue or PR to update this table!
