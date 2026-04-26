@@ -96,6 +96,14 @@ sudo modprobe -r hp_wmi
 echo "blacklist hp_wmi" | sudo tee /etc/modprobe.d/blacklist-hp.conf
 ```
 
+>[!NOTE]
+>if on restarting after install the fan speeds dont show, add this rule and rebuild image
+
+```bash
+echo "softdep omen_rgb_keyboard pre: hp_wmi" | sudo tee /etc/modprobe.d/99-omen-order.conf
+sudo mkinitcpio -P
+```
+
 #### Load the driver:
 
 ```bash
