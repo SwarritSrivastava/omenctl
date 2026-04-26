@@ -298,6 +298,9 @@ Contributions are welcome! Please:
 4. Push to the branch (`git push origin feature/my-feature`)
 5. Open a Pull Request
 
+## Disclaimer
+
+The Developer is not responsible for any hardware damage on using this. 
 ## License
 
 This project is licensed under the **GPL-3.0 License** — see the [LICENSE](LICENSE) file for details.
